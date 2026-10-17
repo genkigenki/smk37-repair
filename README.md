@@ -25,9 +25,11 @@ If it stops at any point, press Repair again: it goes on where it stopped.
 - Nothing at start: it shows its state and answers the page.
 - Only on a command from the page (or SEQ PLAY held for 3 s on the unit):
   - **save**: erases and writes its own copy at 0xF0000-0xF2FFF, then erases the marker sector 0xEA000;
-  - **restore**: only after M-Vave's firmware has rebuilt its mapping. It writes the pairing and calibration sectors
-    only when they are erased, never over other data (a sector that holds something else is left as it is and
-    reported), patches the 10 wheel bytes in the stock globals (0xC2000) and erases its copy.
+  - **restore**: only after M-Vave's firmware has rebuilt its mapping. It puts the pairing and calibration sectors back
+    from its copy and verifies them. Over other data (M-Vave's firmware writes its default calibration after a
+    while) only when the copy was made on the same flash chip (its unique ID, saved with the copy); otherwise only
+    into erased sectors, and anything else is left as it is and reported. It patches the 10 wheel bytes in the stock
+    globals (0xC2000), and erases its copy only after everything is verified.
 - Never the boot area, the firmware area outside its own install, USR or the last sector.
 
 A power cut at any step leaves a state the page can go on from (tested on a simulated flash, a cut after every step).

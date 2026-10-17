@@ -74,7 +74,27 @@ static int n_prog_cal(void *c, uint32_t off, const void *s, uint32_t n)
     }
     return n_prog_any(off, s, n);
 }
-static const rp_io IO = {0, n_read, n_erase, n_prog, n_prog_cal, 0};
+static int n_erase_cal(void *c, uint32_t off)
+{
+    (void)c;
+    if (off != 0xC0000u && off != 0xC1000u) {
+        refused_calls++;
+        return -8;
+    }
+    if (cut())
+        return -9;
+    ops++;
+    memset(nor + off, 0xFF, 0x1000);
+    return 0;
+}
+static uint8_t sim_uid[8];                      /* the chip's unique ID (stock_unit: this unit's) */
+static int n_uid(void *c, uint8_t id[8])
+{
+    (void)c;
+    memcpy(id, sim_uid, 8);
+    return 0;
+}
+static const rp_io IO = {0, n_read, n_erase, n_prog, n_prog_cal, n_erase_cal, n_uid, 0};
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -85,6 +105,8 @@ static int same(uint32_t lo, uint32_t hi, const uint8_t *a, const uint8_t *b) { 
 static void stock_unit(void)
 {
     uint32_t i, n;
+    static const uint8_t UID[8] = {0x11, 0x20, 0x05, 0x02, 0x04, 0x01, 0x05, 0x21};
+    memcpy(sim_uid, UID, 8);
     memset(nor, 0xFF, sizeof nor);
     for (i = 0; i < 0x4000u; i++)
         nor[i] = (uint8_t)(i * 7u + 1u);
@@ -128,6 +150,22 @@ static void stock_rebuild(void)
         for (i = 0; i < 0x29E3u; i++)
             nor[0xC3000u + n * 0x5000u + i] = (uint8_t)(i ^ n);
     memcpy(nor + 0xEAFF8u, "usrdata", 8);
+}
+
+/* what M-Vave's firmware does later, running on the rebuilt unit (seen on a unit): its own default calibration (a
+ * valid "trimdat", 16 values 0x0032 from 0xC1008 every 10) and a new BTIF, written into the erased sectors */
+static void stock_defaults(void)
+{
+    uint32_t i;
+    for (i = 0; i < 0x224u; i++)
+        nor[0xC1000u + i] &= 0x00u;
+    for (i = 0; i < 16u; i++) {
+        nor[0xC1008u + i * 10u] = 0x32u;
+        nor[0xC1009u + i * 10u] = 0x00u;
+    }
+    memcpy(nor + 0xC1224u, "trimdat", 8);
+    for (i = 0; i < 0x40u; i++)
+        nor[0xC0000u + i] = (uint8_t)(0xA0u + i);
 }
 
 static void check_restored(const char *what)
@@ -235,24 +273,117 @@ static void test_refusals(void)
 {
     uint32_t fl;
     int r;
-    /* a calibration that is neither erased nor the stash's (another unit's, say): refused, the stash kept */
+    /* M-Vave's own defaults written after the rebuild (calibration, BTIF): this unit's stash replaces them */
     stock_unit();
     memcpy(ref, nor, sizeof nor);
     rp_do_stash(&IO, &fl);
     stock_rebuild();
-    memset(nor + 0xC1000u, 0x11, 0x100);
+    stock_defaults();
+    CHECK(rp_state(&IO, &fl) == RP_READY && (fl & RP_F_CAL_NOW));
+    r = rp_do_restore(&IO, &fl);
+    CHECK(r == RP_DONE && !(fl & (RP_F_BTIF_REFUSED | RP_F_CAL_REFUSED)));
+    check_restored("defaults replaced");
+    /* the same with a power cut after every step of that restore (the erases of 0xC0000 and 0xC1000 among them) */
+    {
+        static uint8_t rebuilt[0x100000];
+        long k, total;
+        stock_unit();
+        rp_do_stash(&IO, &fl);
+        stock_rebuild();
+        stock_defaults();
+        memcpy(rebuilt, nor, sizeof nor);
+        ops = 0;
+        rp_do_restore(&IO, &fl);
+        total = ops;
+        for (k = 0; k < total; k++) {
+            memcpy(nor, rebuilt, sizeof nor);
+            ops = 0;
+            fail_after = k;
+            r = rp_do_restore(&IO, &fl);
+            CHECK(r == RP_ERR_FLASH);
+            fail_after = -1;
+            CHECK(rp_stash_get(&IO, 0) == 1 || memcmp(nor + 0xC0000u, ref + 0xC0000u, 0x2000u) == 0);
+            r = rp_do_restore(&IO, &fl);
+            CHECK(r == RP_DONE);
+            check_restored("cut in restore over defaults");
+        }
+        printf("power cuts over M-Vave's defaults: after each of the %ld steps, run again: ok\n", total);
+    }
+    /* a stash of another unit (its Bluetooth address bytes differ): refused, nothing written, the stash kept */
+    stock_unit();
+    rp_do_stash(&IO, &fl);
+    stock_rebuild();
+    stock_defaults();
+    memcpy(ref, nor, sizeof nor);
+    nor[0xFFF40u] ^= 0x5Au;
+    ref[0xFFF40u] ^= 0x5Au;
+    r = rp_do_restore(&IO, &fl);
+    CHECK(r == RP_REFUSED && (fl & RP_F_CAL_REFUSED) && (fl & RP_F_BTIF_REFUSED));
+    CHECK(!memcmp(nor, ref, sizeof nor) && rp_stash_get(&IO, 0) == 1);
+    /* another chip (its unique ID differs, the address bytes the same, FF as on the SMK-37s): refused, nothing
+     * written */
+    stock_unit();
+    memset(nor + 0xFFF40u, 0xFF, 8);
+    rp_do_stash(&IO, &fl);
+    stock_rebuild();
+    stock_defaults();
+    memcpy(ref, nor, sizeof nor);
+    sim_uid[7] ^= 1u;
     r = rp_do_restore(&IO, &fl);
     CHECK(r == RP_REFUSED && (fl & RP_F_CAL_REFUSED));
-    CHECK(nor[0xC1000u] == 0x11u && rp_stash_get(&IO, 0) == 1);
-    /* BTIF re-paired after the rebuild: kept as it is, the rest done */
-    stock_unit();
-    memcpy(ref, nor, sizeof nor);
-    rp_do_stash(&IO, &fl);
-    stock_rebuild();
-    memset(nor + 0xC0000u, 0x22, 0x40);
+    CHECK(!memcmp(nor, ref, sizeof nor) && rp_stash_get(&IO, 0) == 1);
+    sim_uid[7] ^= 1u;                                   /* the right chip again: done */
     r = rp_do_restore(&IO, &fl);
-    CHECK(r == RP_DONE && (fl & RP_F_BTIF_REFUSED));
-    CHECK(nor[0xC0000u] == 0x22u && !memcmp(nor + 0xC1000u, ref + 0xC1000u, 0x1000u));
+    CHECK(r == RP_DONE && nor[0xC1008u] != 0x32u);
+    /* no usable unique ID (all FF, or all 00): erased sectors only, M-Vave's defaults there are refused */
+    {
+        int z;
+        for (z = 0; z < 2; z++) {
+            static uint8_t rebuilt[0x100000];
+            stock_unit();
+            memcpy(ref, nor, sizeof nor);
+            memset(sim_uid, z ? 0x00 : 0xFF, 8);
+            rp_do_stash(&IO, &fl);
+            stock_rebuild();
+            memcpy(rebuilt, nor, sizeof nor);
+            r = rp_do_restore(&IO, &fl);
+            CHECK(r == RP_DONE);
+            check_restored(z ? "uid 00, erased sectors" : "uid FF, erased sectors");
+            memcpy(nor, rebuilt, sizeof nor);
+            stock_defaults();
+            r = rp_do_restore(&IO, &fl);
+            CHECK(r == RP_REFUSED && (fl & RP_F_CAL_REFUSED) && nor[0xC1008u] == 0x32u && rp_stash_get(&IO, 0) == 1);
+        }
+    }
+    /* a stash of 0.1 (version 1, no address): put back only into erased sectors; defaults there: refused, kept */
+    {
+        uint8_t h[36];
+        uint32_t c;
+        stock_unit();
+        memcpy(ref, nor, sizeof nor);
+        rp_do_stash(&IO, &fl);
+        memcpy(h, nor + 0xF0000u, 32);
+        h[8] = 1;
+        c = rp_crc(0xFFFFFFFFu, h, 32);
+        c = rp_crc(c, nor + 0xF1000u, 0x1000u);
+        c = rp_crc(c, nor + 0xF2000u, 0x1000u);
+        rp_put32(h + 32, ~c);
+        memset(nor + 0xF0000u, 0xFF, 64);
+        memcpy(nor + 0xF0000u, h, 36);
+        CHECK(rp_stash_get(&IO, 0) == 1);
+        {
+            static uint8_t v1[0x100000];
+            stock_rebuild();
+            memcpy(v1, nor, sizeof nor);
+            r = rp_do_restore(&IO, &fl);                /* the sectors erased: put back */
+            CHECK(r == RP_DONE);
+            check_restored("0.1 stash, erased sectors");
+            memcpy(nor, v1, sizeof nor);
+            stock_defaults();
+            r = rp_do_restore(&IO, &fl);                /* M-Vave's defaults there: refused */
+            CHECK(r == RP_REFUSED && (fl & RP_F_CAL_REFUSED) && nor[0xC1008u] == 0x32u && rp_stash_get(&IO, 0) == 1);
+        }
+    }
     /* no calibration on the unit: stashed without it; the restore leaves USRTRIM alone */
     stock_unit();
     memset(nor + 0xC1000u, 0xFF, 0x1000u);
@@ -271,6 +402,7 @@ static void test_refusals(void)
     CHECK(r == RP_STASHED);
     CHECK(rp_state(&IO, &fl) == RP_WAIT_STOCK);
     stock_rebuild();
+    stock_defaults();
     r = rp_do_restore(&IO, &fl);
     CHECK(r == RP_DONE && !memcmp(nor + 0xC0000u, ref + 0xC0000u, 0x2000u));
     CHECK(refused_calls == 0);
@@ -311,6 +443,13 @@ static void test_dumps(void)
     memcpy(nor + 0xC2060u, after + 0xC2060u, 4);
     memcpy(nor + 0xC2080u, after + 0xC2080u, 6);
     CHECK(!memcmp(nor + 0xC2000u, after + 0xC2000u, 0x28000u));
+    /* again, with M-Vave's defaults written over the rebuilt unit before the restore */
+    memcpy(nor, ref, sizeof nor);
+    r = rp_do_stash(&IO, &fl);
+    memcpy(nor + 0xC0000u, after + 0xC0000u, 0x30000u);
+    stock_defaults();
+    r = rp_do_restore(&IO, &fl);
+    CHECK(r == RP_DONE && !memcmp(nor + 0xC0000u, ref + 0xC0000u, 0x2000u));
     printf("real dumps: %s\n", fails != f0 ? "FAILED" : "ok");
 }
 

@@ -10,19 +10,26 @@
  *   STASH    the unit's own BTIF and USRTRIM and the 10 wheel bytes are copied, with a CRC, to 0xF0000-0xF2FFF (blank
  *            on a stock unit, outside the rebuild's blocks, below the stock USR resources at 0xF4000); then the marker
  *            is released (its sector erased). M-Vave's firmware then rebuilds a clean mapping.
- *   RESTORE  (this firmware installed again) with a valid stash and the rebuilt mapping in place: BTIF and USRTRIM
- *            are programmed back where they are erased (never erased here: a sector that holds anything but erased
- *            bytes or the stash's own bytes is refused; BTIF re-paired since stays as it is, a calibration that is
- *            not the unit's own keeps the stash), the wheel values patched into the globals, then the stash erased.
+ *   RESTORE  (this firmware installed again) with a valid stash of THIS unit (the flash chip's unique ID, read with
+ *            0x4B, and the address bytes at 0xFFF40, both recorded in the stash) and the rebuilt mapping in place:
+ *            BTIF and USRTRIM are put back as they
+ *            were. M-Vave's firmware may have written its own defaults there meanwhile (a default "trimdat", a new
+ *            BTIF): a sector that differs is erased (4 KiB, 0xC0000 / 0xC1000 only, app.c's own routine) and
+ *            programmed with the stash's copy, then checked. Then the wheel values into the globals, and only when
+ *            all of it is verified, the stash is erased. A stash of another unit is refused, nothing written. Without a
+ *            usable unique ID (all 00 or FF, now or in the stash), and for a stash of 0.1: put back only where the
+ *            sector is erased or already holds the stash's bytes.
  *
  * Stash, sector 0xF0000 (the header is programmed last: a stash is valid only once complete):
  *   +0   "SMKREPR1"
- *   +8   version 1, flags (RP_SF_*), 0, 0
+ *   +8   version (2; 0.1 wrote 1), flags (RP_SF_*), 0, 0
  *   +12  the 10 wheel bytes (0xC2060 4, 0xC2080 6)
  *   +22  0, 0
  *   +24  CRC-32 of the globals (0xC2000) and +28 of the first preset's sector (0xC3000) at the stash: a rebuild changes
  *        them, so a RESTORE runs only after one (and a STASH cut before its release is finished, not repeated)
- *   +32  CRC-32 (zlib) over +0..+31, then the sectors 0xF1000 and 0xF2000
+ *   +32  CRC-32 (zlib) over +0..+31, (version 2:) +36..+51, then the sectors 0xF1000 and 0xF2000
+ *   +36  (version 2) the unit's Bluetooth address bytes, 0xFFF40..0xFFF47 (FF on the SMK-37s seen)
+ *   +44  (version 2) the flash chip's unique ID (8 bytes): the stash belongs to this unit
  *   +64  the patched globals' record, programmed during a RESTORE (erased until then): "SMKREPG1", CRC-32 of 0xF3000
  *   0xF1000  BTIF's copy        0xF2000  USRTRIM's copy        0xF3000  the patched globals (during a RESTORE)
  * Every step can be cut by a power loss and run again. */
@@ -43,6 +50,7 @@
 #define RP_S_GLOB    0x000F3000u
 #define RP_STASH_HI  0x000F4000u
 #define RP_SEC       0x1000u
+#define RP_MAC       0x000FFF40u                /* the unit's Bluetooth address + CRC (key_mac page), 8 bytes */
 
 enum { RP_SF_GLOB = 1, RP_SF_WHEELS = 2, RP_SF_CAL = 4 };   /* stash flags */
 
@@ -57,6 +65,8 @@ typedef struct {
     int (*erase)(void *ctx, uint32_t off);                                /* one 4 KiB sector, 0 = ok */
     int (*prog)(void *ctx, uint32_t off, const void *src, uint32_t n);    /* within one 256 B page, 0 = ok */
     int (*prog_cal)(void *ctx, uint32_t off, const void *src, uint32_t n);   /* the same, only [0xC0000, 0xC2000) */
+    int (*erase_cal)(void *ctx, uint32_t off);                            /* only 0xC0000 or 0xC1000, 0 = ok */
+    int (*uid)(void *ctx, uint8_t id[8]);                                 /* the flash chip's unique ID, 0 = ok */
     void (*idle)(void);                                                   /* the watchdog; may be 0 */
 } rp_io;
 
@@ -148,25 +158,38 @@ static int rp_intact(const rp_io *io)
     return 1;
 }
 static int rp_cal_now(const rp_io *io) { return rp_has(io, RP_TRIM_MARK, "trimdat", 8); }
+/* a unique ID that tells units apart: not all 00, not all FF */
+static int rp_uid_ok(const uint8_t *u)
+{
+    uint32_t i, o = 0, a = 0xFFu;
+    for (i = 0; i < 8u; i++) {
+        o |= u[i];
+        a &= u[i];
+    }
+    return o != 0u && a != 0xFFu;
+}
 
 /* ---------------------------------------------------------------- the stash */
 typedef struct {
-    uint8_t flags;
+    uint8_t ver, flags;
     uint8_t wheels[10];
+    uint8_t mac[8], uid[8];                     /* (version 2) */
     uint32_t crc_glob, crc_preset0;             /* the mapping as it was at the stash: a rebuild changes both */
 } rp_stash;
 
 /* 1: a complete stash (its CRC), read into *s; 0: none; < 0 a read error */
 static int rp_stash_get(const rp_io *io, rp_stash *s)
 {
-    uint8_t h[36];
+    uint8_t h[52];
     uint32_t c;
     int err = 0;
     if (io->read(io->ctx, RP_STASH, h, sizeof h))
         return -1;
-    if (!rp_same(h, (const uint8_t *)"SMKREPR1", 8) || h[8] != 1u)
+    if (!rp_same(h, (const uint8_t *)"SMKREPR1", 8) || (h[8] != 1u && h[8] != 2u))
         return 0;
     c = rp_crc(0xFFFFFFFFu, h, 32);
+    if (h[8] == 2u)
+        c = rp_crc(c, h + 36, 16);
     c = rp_crc_sec(io, c, RP_S_BTIF, &err);
     c = rp_crc_sec(io, c, RP_S_TRIM, &err);
     if (err)
@@ -175,9 +198,14 @@ static int rp_stash_get(const rp_io *io, rp_stash *s)
         return 0;
     if (s) {
         uint32_t i;
+        s->ver = h[8];
         s->flags = h[9];
         for (i = 0; i < 10u; i++)
             s->wheels[i] = h[12 + i];
+        for (i = 0; i < 8u; i++) {
+            s->mac[i] = h[36 + i];
+            s->uid[i] = h[44 + i];
+        }
         s->crc_glob = rp_le32(h + 24);
         s->crc_preset0 = rp_le32(h + 28);
     }
@@ -247,7 +275,7 @@ static int rp_copy(const rp_io *io, uint32_t from, uint32_t to)
  * rebuilt unit's erased calibration), or RP_ERR_FLASH */
 static int rp_do_stash(const rp_io *io, uint32_t *flags)
 {
-    uint8_t h[36], g[2];
+    uint8_t h[52], g[2];
     uint32_t s, c, i;
     int r, err = 0;
     rp_stash st;
@@ -281,7 +309,9 @@ static int rp_do_stash(const rp_io *io, uint32_t *flags)
         h[i] = 0;
     for (i = 0; i < 8u; i++)
         h[i] = (uint8_t)"SMKREPR1"[i];
-    h[8] = 1;
+    h[8] = 2;
+    if (io->read(io->ctx, RP_MAC, h + 36, 8) || io->uid(io->ctx, h + 44))
+        return RP_ERR_FLASH;
     if (io->read(io->ctx, RP_GLOB, g, 2) || io->read(io->ctx, RP_WHEEL_A, h + 12, 4) ||
         io->read(io->ctx, RP_WHEEL_B, h + 16, 6))
         return RP_ERR_FLASH;
@@ -304,6 +334,7 @@ static int rp_do_stash(const rp_io *io, uint32_t *flags)
     rp_put32(h + 24, ~rp_crc_sec(io, 0xFFFFFFFFu, RP_GLOB, &err));
     rp_put32(h + 28, ~rp_crc_sec(io, 0xFFFFFFFFu, RP_GLOB + 0x1000u, &err));
     c = rp_crc(0xFFFFFFFFu, h, 32);
+    c = rp_crc(c, h + 36, 16);
     c = rp_crc_sec(io, c, RP_S_BTIF, &err);
     c = rp_crc_sec(io, c, RP_S_TRIM, &err);
     if (err)
@@ -320,25 +351,31 @@ static int rp_do_stash(const rp_io *io, uint32_t *flags)
     return RP_STASHED;
 }
 
-/* put a stashed sector back: skipped when it already is, programmed when every byte is erased or already the stash's
- * (also after a cut-off run), refused otherwise (1). 0 done, 1 refused, < 0 a flash error */
-static int rp_put_back(const rp_io *io, uint32_t from, uint32_t to)
+/* put a stashed sector back. own (a stash of this unit): the sector becomes the stash's copy, erased first when it
+ * holds anything else (M-Vave's defaults written since). Not own (a 0.1 stash): skipped when the copy is erased,
+ * refused (1) when the sector holds anything but erased bytes or the copy's own. Programming only where the sector is
+ * erased or already the copy's, so a cut-off run is finished by the next. 0 done, 1 refused, < 0 a flash error */
+static int rp_put_back(const rp_io *io, uint32_t from, uint32_t to, int own)
 {
     uint8_t b[256], v[256];
-    uint32_t i, k, any = 0;
-    for (i = 0; i < RP_SEC; i += 256u) {        /* a stashed sector that was erased: nothing to put back */
-        if (io->read(io->ctx, from + i, b, 256))
-            return -1;
-        any |= !rp_blank(b, 256);
-    }
-    if (!any)
-        return 0;
-    for (i = 0; i < RP_SEC; i += 256u) {        /* first the check, over the whole sector: nothing written if refused */
+    uint32_t i, k, any = 0, clash = 0, diff = 0;
+    for (i = 0; i < RP_SEC; i += 256u) {        /* first the comparison, over the whole sector */
         if (io->read(io->ctx, from + i, b, 256) || io->read(io->ctx, to + i, v, 256))
             return -1;
-        for (k = 0; k < 256u; k++)
-            if (v[k] != 0xFFu && v[k] != b[k])
-                return 1;
+        any |= !rp_blank(b, 256);
+        for (k = 0; k < 256u; k++) {
+            clash |= v[k] != 0xFFu && v[k] != b[k];
+            diff |= v[k] != b[k];
+        }
+    }
+    if (!diff || (!own && !any))
+        return 0;                               /* as it was; or (0.1) nothing stashed to put back */
+    if (clash) {
+        if (!own)
+            return 1;
+        rp_idle(io);
+        if (io->erase_cal(io->ctx, to))
+            return -2;
     }
     for (i = 0; i < RP_SEC; i += 256u) {
         if (io->read(io->ctx, from + i, b, 256) || io->read(io->ctx, to + i, v, 256))
@@ -429,7 +466,7 @@ static int rp_do_restore(const rp_io *io, uint32_t *flags)
 {
     rp_stash st;
     uint32_t s;
-    int r = rp_stash_get(io, &st), refused = 0;
+    int r = rp_stash_get(io, &st), refused = 0, own = 0;
     *flags = 0;
     if (r < 0)
         return RP_ERR_FLASH;
@@ -459,14 +496,24 @@ static int rp_do_restore(const rp_io *io, uint32_t *flags)
         return RP_WAIT_STOCK;
     if (st.flags & RP_SF_CAL)
         *flags |= RP_F_STASH_CAL;
-    r = rp_put_back(io, RP_S_BTIF, RP_BTIF);
+    if (st.ver >= 2u) {                             /* this unit's stash, or nothing is written */
+        uint8_t m[8], u[8];
+        if (io->read(io->ctx, RP_MAC, m, 8) || io->uid(io->ctx, u))
+            return RP_ERR_FLASH;
+        if (!rp_same(m, st.mac, 8) || (rp_uid_ok(u) && rp_uid_ok(st.uid) && !rp_same(u, st.uid, 8))) {
+            *flags |= RP_F_BTIF_REFUSED | RP_F_CAL_REFUSED;
+            return RP_REFUSED;
+        }
+        own = rp_uid_ok(u) && rp_uid_ok(st.uid);    /* the same chip: the sectors may be replaced; else erased-only */
+    }
+    r = rp_put_back(io, RP_S_BTIF, RP_BTIF, own);
     if (r < 0)
         return RP_ERR_FLASH;
     if (r)
-        *flags |= RP_F_BTIF_REFUSED;              /* (pairings made since: they stay, the old ones are let go) */
+        *flags |= RP_F_BTIF_REFUSED;              /* (0.1 stash: pairings made since stay, the old ones go) */
     rp_idle(io);
     if (st.flags & RP_SF_CAL) {                     /* (no calibration in the stash: nothing to put back) */
-        r = rp_put_back(io, RP_S_TRIM, RP_TRIM);
+        r = rp_put_back(io, RP_S_TRIM, RP_TRIM, own);
         if (r < 0)
             return RP_ERR_FLASH;
         if (r) {

@@ -48,6 +48,15 @@ static int fr_prog(void *c, uint32_t off, const void *s, uint32_t n)
     return 0;
 }
 #define fr_prog_cal fr_prog
+#define fr_erase_cal fr_erase
+static int fr_uid(void *c, uint8_t id[8])
+{
+    uint32_t i;
+    (void)c;
+    for (i = 0; i < 8u; i++)
+        id[i] = (uint8_t)(0x11u * (i + 1u));
+    return 0;
+}
 static void fr_idle(void) {}
 #else
 /* the windows repair.h may touch, checked again here (the RAM driver checks FL_GUARD / FL_ERASE_GUARD on top) */
@@ -124,9 +133,78 @@ static int fr_prog_cal(void *c, uint32_t off, const void *s, uint32_t n)
     irq_restore(f);
     return rc;
 }
+/* ... and erased first when M-Vave's firmware wrote its own defaults there: fm1_flash.h's fl_erase4k_ram with its own
+ * guard, the two sectors 0xC0000 and 0xC1000 and nothing else (repair.h: only with a stash of this unit) */
+static RAMFN int fr_erase_cal_ram(uint32_t off, uint32_t *took_us)
+{
+    fl_saved_t s;
+    int rc;
+    if (off != 0x000C0000u && off != 0x000C1000u)
+        return -1;
+    if (fl_enter(&s))
+        return -2;
+    fl_wren();
+    if (!(fl_rdsr(0x05) & 2u))
+        rc = -3;
+    else {
+        fl_cs(0);
+        fl_tx(0x20);
+        fl_addr(off);
+        fl_cs(1);
+        fl_inval(off, 4096u);
+        rc = fl_wait_ready(500000u, took_us);
+    }
+    fl_exit(&s);
+    return rc;
+}
+static int fr_erase_cal(void *c, uint32_t off)
+{
+    uint32_t took, f;
+    int rc;
+    (void)c;
+    if (!flash_ok || (off != 0x000C0000u && off != 0x000C1000u))
+        return -8;
+    audio_silence();
+    f = irq_save();
+    rc = FL_FAR(fr_erase_cal_ram)(off, &took);
+    irq_restore(f);
+    return rc;
+}
+/* the flash chip's unique ID: 0x4B, four dummy bytes, eight bytes of ID (in the style of fm1_flash.h fl_jedec_ram) */
+static RAMFN int fr_uid_ram(uint8_t *id)
+{
+    fl_saved_t s;
+    uint32_t i;
+    if (fl_enter(&s))
+        return -2;
+    fl_cs(0);
+    fl_tx(0x4B);
+    for (i = 0; i < 4u; i++)
+        fl_tx(0xFF);
+    for (i = 0; i < 8u; i++)
+        id[i] = fl_rx();
+    fl_cs(1);
+    fl_exit(&s);
+    return 0;
+}
+static int fr_uid(void *c, uint8_t id[8])
+{
+    static uint8_t buf[8];                       /* (RAM: the routine runs with XIP off) */
+    uint32_t i, f;
+    int rc;
+    (void)c;
+    if (!flash_ok)
+        return -8;
+    f = irq_save();
+    rc = FL_FAR(fr_uid_ram)(buf);
+    irq_restore(f);
+    for (i = 0; i < 8u; i++)
+        id[i] = buf[i];
+    return rc;
+}
 static void fr_idle(void) { fm1_wdt_feed(); }
 #endif
-static const rp_io IO = {0, fr_read, fr_erase, fr_prog, fr_prog_cal, fr_idle};
+static const rp_io IO = {0, fr_read, fr_erase, fr_prog, fr_prog_cal, fr_erase_cal, fr_uid, fr_idle};
 
 /* ------------------------------------------------------------------ the state */
 enum { OP_NONE, OP_STASH = 3, OP_RESTORE = 4 };

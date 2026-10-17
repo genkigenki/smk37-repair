@@ -11,7 +11,7 @@
 #define APP_SPLASH_RGB RGB(64, 168, 220)
 #define APP_TAGLINE "key mapping repair"
 #ifndef APP_VERSION
-#define APP_VERSION "0.1"                /* (tools/build.py --release passes its own) */
+#define APP_VERSION "0.1.1"                /* (tools/build.py --release passes its own) */
 #endif
 #define APP_BLOCK 256u
 #define APP_CANVAS_PX (240u * 64u)

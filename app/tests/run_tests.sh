@@ -26,11 +26,11 @@ run image-size sh -c "test \$(stat -c %s $B/smkrepair.bin) -le 619520"
 run no-plat-data sh -c "! grep -E 'call .*<plat_data_(erase|write)>' $B/smkrepair.dis"
 run loader-range sh -c "$PY -c \"import os; open('$OUT/full.bin','wb').write(open('$B/smkrepair.bin','rb').read() + os.urandom(0x97400 - os.path.getsize('$B/smkrepair.bin')))\" && \
     head -c 60000 $B/smkrepair.bin > $OUT/old.bin && \
-    $PY base/tools/fm1pkg_make.py --board smk37 --product 'SMK-37 Pro_490100' $OUT/full.bin $B/loader/ota.bin $OUT/full.fwsc >/dev/null && \
-    $PY base/tools/fm1pkg_make.py --board smk37 --product 'SMK-37 Pro_490100' $OUT/old.bin $B/loader/ota.bin $OUT/old.fwsc >/dev/null && \
+    $PY base/tools/fm1pkg_make.py --board smk37 --product 'SMK-37 Pro_490101' $OUT/full.bin $B/loader/ota.bin $OUT/full.fwsc >/dev/null && \
+    $PY base/tools/fm1pkg_make.py --board smk37 --product 'SMK-37 Pro_490101' $OUT/old.bin $B/loader/ota.bin $OUT/old.fwsc >/dev/null && \
     $CC -w -DBOARD_SMK37=1 -o $OUT/ldr_test base/tests/ldr_test.c && $OUT/ldr_test $OUT/old.fwsc $OUT/full.fwsc"
 for m in pro elite mke; do
-    case $m in pro) d=smk37; id="SMK-37 Pro_490100";; elite) d=smk37-elite; id="SMK-37 Elite_490100";; mke) d=smk37-mke; id="MKE-P37_490100";; esac
+    case $m in pro) d=smk37; id="SMK-37 Pro_490101";; elite) d=smk37-elite; id="SMK-37 Elite_490101";; mke) d=smk37-mke; id="MKE-P37_490101";; esac
     f=$(ls app/build/$d/*.fwsc 2>/dev/null | head -1)
     if [ -n "$f" ]; then run package-$m "$PY" base/tests/smk_pkg_test.py "$f" "$id"; else echo "  skip package-$m (not built)"; fi
 done

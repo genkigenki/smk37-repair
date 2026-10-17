@@ -1,7 +1,8 @@
 # SMK-37 Repair's build settings (fm1-base's tools/build.py: ./build.sh)
 name = "SMKREPAIR"             # the build's files: smkrepair-smk37.fwsc
 id_prefix = "FM-1_49"          # package identity family _49x
-smk_id_prefix = "4901"         # the SMK-37: SMK-37 Pro_490100 (0.1)
+smk_id_prefix = "4901"         # the SMK-37: SMK-37 Pro_4901 + id_suffix
+id_suffix = "01"               # 0.1.1: SMK-37 Pro_490101
 usb_manufacturer = "smk37"
 usb_product = "FM-1 Repair"    # on the SMK-37: "SMK-37 Repair"
 words = "words.tsv"
