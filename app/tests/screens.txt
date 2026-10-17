@@ -1,0 +1,13 @@
+# SMK-37 Repair's screens on the host (a blank simulated unit: no calibration):
+#   app/build/smk37/host/smkrepair-smk37_host app/tests/screens.txt OUTDIR
+wait 1500
+shot idle.png
+expect state 1
+press PLAY
+wait 1500
+shot hold.png
+wait 1700
+release PLAY
+wait 300
+shot saved.png
+expect state 2

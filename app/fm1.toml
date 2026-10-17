@@ -1,0 +1,14 @@
+# SMK-37 Repair's build settings (fm1-base's tools/build.py: ./build.sh)
+name = "SMKREPAIR"             # the build's files: smkrepair-smk37.fwsc
+id_prefix = "FM-1_49"          # package identity family _49x
+smk_id_prefix = "4901"         # the SMK-37: SMK-37 Pro_490100 (0.1)
+usb_manufacturer = "smk37"
+usb_product = "FM-1 Repair"    # on the SMK-37: "SMK-37 Repair"
+words = "words.tsv"
+ble = false
+o2 = []
+# the site
+tagline = "puts M-Vave's key mapping back, keeping the calibration"
+repo = "https://github.com/genkigenki/smk37-repair"
+licence = "MPL-2.0"
+credits = "Built on fm1-base and felucca-bsp."
